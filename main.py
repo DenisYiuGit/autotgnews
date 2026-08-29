@@ -565,43 +565,46 @@ def send_telegram(text, image_url=None):
         print("ОШИБКА: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не установлен!")
         return False
 
-    resolved_image_url = image_url or get_fallback_image_url(text)
+    if image_url:
+        resolved_image_url = image_url
+    else:
+        resolved_image_url = get_fallback_image_url(text)
     if not resolved_image_url:
         resolved_image_url = "https://placehold.co/1200x630/png?text=News"
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    send_message_payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+
+    photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "photo": resolved_image_url,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
     }
-
     if len(text) <= 1024:
         payload["caption"] = text
 
     try:
-        res = requests.post(url, json=payload, timeout=20)
+        res = requests.post(photo_url, json=payload, timeout=20)
         if res.status_code == 200:
             return True
         print(f"sendPhoto error: {res.text}")
     except Exception as e:
         print(f"Ошибка sendPhoto: {e}")
 
-    if len(text) > 1024:
-        fallback_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        fallback_payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }
-        try:
-            fallback_res = requests.post(fallback_url, json=fallback_payload, timeout=20)
-            if fallback_res.status_code == 200:
-                return True
-            print(f"sendMessage fallback error: {fallback_res.text}")
-        except Exception as e:
-            print(f"Ошибка sendMessage fallback: {e}")
+    message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        res = requests.post(message_url, json=send_message_payload, timeout=20)
+        if res.status_code == 200:
+            print("Фото сломалось, отправка текста выполнена как fallback.")
+            return True
+        print(f"sendMessage fallback error: {res.text}")
+    except Exception as e:
+        print(f"Ошибка sendMessage fallback: {e}")
 
     return False
 
@@ -699,7 +702,7 @@ def process_updates():
     try:
         response = requests.get(
             url,
-            params={"timeout": 5, "limit": 20, "offset": last_processed + 1},
+            params={"timeout": 0, "limit": 20, "offset": last_processed + 1},
             timeout=20,
         )
         response.raise_for_status()
@@ -745,6 +748,7 @@ def process_updates():
             settings = load_settings()
             settings["manual_trigger"] = True
             settings["manual_post_done"] = True
+            settings["last_processed_update_id"] = update_id
             save_settings(settings)
             send_telegram_message(chat_id, "<b>Ручной запуск активирован.</b>")
         elif command.startswith("/set_interval"):
@@ -761,6 +765,7 @@ def process_updates():
                 continue
             settings = load_settings()
             settings["interval_minutes"] = minutes
+            settings["last_processed_update_id"] = update_id
             save_settings(settings)
             send_telegram_message(chat_id, f"<b>Интервал установлен:</b> {minutes} минут.")
         elif command == "/stats":
@@ -814,6 +819,9 @@ def check_and_post():
             settings["manual_post_done"] = False
             save_settings(settings)
             return True
+        settings["manual_trigger"] = False
+        save_settings(settings)
+        return False
 
     interval_minutes = max(1, int(settings.get("interval_minutes", 60)))
     last_post_time = settings.get("last_post_time")
@@ -953,7 +961,8 @@ def publish_news_once():
 
     print("Успешно отправлено в Telegram!")
 
-    published.append(entry_id)
+    if entry_id not in published:
+        published.append(entry_id)
     if not save_published(published):
         print("Не удалось сохранить published.json после публикации, повторяем попытку через 5 сек...")
         time.sleep(5)
@@ -979,7 +988,6 @@ if __name__ == "__main__":
         settings["interval_minutes"] = 60
         save_settings(settings)
 
-    while True:
-        process_updates()
-        check_and_post()
-        time.sleep(15)
+    process_updates()
+    check_and_post()
+    exit(0)
