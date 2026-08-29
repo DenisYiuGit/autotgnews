@@ -5,6 +5,7 @@ import os
 import re
 import json
 import html
+import time
 import datetime
 import random
 from urllib.parse import quote
@@ -15,6 +16,8 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+LAST_TELEGRAM_UPDATE_ID = 0
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
 
 # ============================================================
 # НАСТРОЙКИ
@@ -52,6 +55,35 @@ if TELEGRAM_CHANNEL_LINK and "@" not in TELEGRAM_CHANNEL_NAME and "Наша Ра
     default_slug = TELEGRAM_CHANNEL_LINK.rstrip("/").split("/")[-1]
     if default_slug:
         TELEGRAM_CHANNEL_NAME = f"⚡️ {default_slug}"
+
+
+def load_settings():
+    default_settings = {
+        "interval_minutes": 60,
+        "last_post_time": None,
+        "total_posts": 0,
+        "total_tokens": 0,
+        "manual_trigger": False,
+    }
+    if not os.path.exists(SETTINGS_PATH):
+        save_settings(default_settings)
+        return default_settings.copy()
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        save_settings(default_settings)
+        return default_settings.copy()
+    for key, value in default_settings.items():
+        if key not in data:
+            data[key] = value
+    return data
+
+
+def save_settings(settings):
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
 
 # Расширенный список RSS-лент (новости, экономика, IT)
 RSS_FEEDS = [
@@ -386,12 +418,12 @@ def generate_rewrite(title, summary, article_url):
 
     source_text = clean_summary or clean_title or ""
     if source_text:
-        source_text = source_text[:3000]
+        source_text = source_text[:2000]
         print(f"Используется краткое описание RSS: {len(source_text)} символов")
 
     if not source_text:
         source_text = clean_title
-    source_text = source_text[:3000]
+    source_text = source_text[:2000]
 
     prompt = f"""
 Ты — редактор новостного Telegram-канала.
@@ -423,6 +455,12 @@ def generate_rewrite(title, summary, article_url):
 
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=40)
+        if res.status_code == 429:
+            settings = load_settings()
+            settings["interval_minutes"] = 120
+            save_settings(settings)
+            print("Превышен лимит Groq (429). Интервал увеличен до 120 минут.")
+            return None
         if res.status_code != 200:
             print(f"Ошибка Groq API ({res.status_code}): {res.text}")
             return None
@@ -551,6 +589,24 @@ def send_telegram(text, image_url=None):
 
     return False
 
+
+def send_telegram_message(chat_id, text):
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=20)
+        return res.status_code == 200
+    except Exception as e:
+        print(f"Ошибка отправки сообщения в Telegram: {e}")
+        return False
+
 # ============================================================
 # LOG TO ADMIN
 # ============================================================
@@ -599,6 +655,96 @@ def send_log_to_admin(post_title, article_url):
             print("Лог отправлен администратору.")
     except Exception as e:
         print(f"Исключение при отправке лога: {e}")
+
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+
+def get_admin_chat_id():
+    try:
+        return int(str(ADMIN_CHAT_ID).strip()) if str(ADMIN_CHAT_ID).strip() else None
+    except Exception:
+        return None
+
+
+def process_admin_commands():
+    global LAST_TELEGRAM_UPDATE_ID
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    admin_id = get_admin_chat_id()
+    if admin_id is None:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        response = requests.get(url, params={"timeout": 5, "limit": 20, "offset": LAST_TELEGRAM_UPDATE_ID + 1}, timeout=20)
+        response.raise_for_status()
+        updates = response.json().get("result", [])
+    except Exception as e:
+        print(f"Ошибка получения обновлений Telegram: {e}")
+        return
+
+    for update in updates:
+        update_id = int(update.get("update_id", 0))
+        if update_id <= LAST_TELEGRAM_UPDATE_ID:
+            continue
+        LAST_TELEGRAM_UPDATE_ID = update_id
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        user = message.get("from") or {}
+        user_id = user.get("id")
+        text = (message.get("text") or "").strip()
+        try:
+            chat_id_int = int(chat_id)
+            user_id_int = int(user_id)
+        except (TypeError, ValueError):
+            continue
+        if not text or chat_id_int != admin_id or user_id_int != admin_id:
+            continue
+
+        command = text.split()[0].lower()
+        if command == "/start":
+            help_text = """<b>Telegram News Bot</b>\n\nКоманды:\n/start — приветствие и справка\n/post_now — опубликовать новость немедленно\n/set_interval 30 — задать интервал в минутах\n/stats — показать статистику\n/help — список команд"""
+            send_telegram_message(chat_id, help_text)
+        elif command == "/post_now":
+            settings = load_settings()
+            settings["manual_trigger"] = True
+            save_settings(settings)
+            send_telegram_message(chat_id, "<b>Ручной запуск активирован.</b>")
+        elif command.startswith("/set_interval"):
+            args = text.split()
+            if len(args) < 2:
+                send_telegram_message(chat_id, "Формат: <code>/set_interval 30</code>")
+                continue
+            try:
+                minutes = int(args[1])
+                if minutes <= 0:
+                    raise ValueError
+            except ValueError:
+                send_telegram_message(chat_id, "Неверное значение. Используйте целое число минут больше 0.")
+                continue
+            settings = load_settings()
+            settings["interval_minutes"] = minutes
+            save_settings(settings)
+            send_telegram_message(chat_id, f"<b>Интервал установлен:</b> {minutes} минут.")
+        elif command == "/stats":
+            settings = load_settings()
+            stats_text = (
+                "<b>Статистика</b>\n\n"
+                f"Опубликовано новостей: <b>{settings.get('total_posts', 0)}</b>\n"
+                f"Потрачено токенов: <b>{settings.get('total_tokens', 0)}</b>\n"
+                f"Текущий интервал: <b>{settings.get('interval_minutes', 60)}</b> минут\n"
+                f"Время последнего поста: <b>{settings.get('last_post_time') or 'нет'}</b>"
+            )
+            send_telegram_message(chat_id, stats_text)
+        elif command == "/help":
+            help_text = """<b>Команды:</b>\n/start\n/post_now\n/set_interval 30\n/stats\n/help"""
+            send_telegram_message(chat_id, help_text)
+        else:
+            send_telegram_message(chat_id, "Неизвестная команда. Используйте /help.")
+
 
 # ============================================================
 # SMART NEWS SELECTION
@@ -670,11 +816,10 @@ def news_score(entry):
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+def publish_news_once():
     published = load_published()
     all_candidates = []
 
-    # Собираем все новые новости со всех лент
     for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
@@ -690,12 +835,9 @@ if __name__ == "__main__":
 
     if not all_candidates:
         print("Новых новостей не найдено.")
-        exit(0)
+        return False
 
-    # Выбираем самую «интересную» по очкам
     best_entry = max(all_candidates, key=news_score)
-
-    # Обрабатываем и публикуем
     title = best_entry.get("title", "")
     summary = best_entry.get("summary") or best_entry.get("description") or title
     article_url = best_entry.get("link") or best_entry.get("id") or ""
@@ -705,19 +847,54 @@ if __name__ == "__main__":
     entry_id = best_entry.get("id") or best_entry.get("link")
 
     print(f"\nОбработка новости: {title}")
-
     rewritten = generate_rewrite(title, summary, article_url)
-    if rewritten:
-        print("\nСформированный пост:")
-        print(rewritten)
-
-        if send_telegram(rewritten, image_url):
-            print("Успешно отправлено в Telegram!")
-            published.append(entry_id)
-            save_published(published)
-            send_log_to_admin(title, article_url)
-            exit(0)
-        else:
-            print("Не удалось отправить пост.")
-    else:
+    if not rewritten:
         print("Не удалось сгенерировать пост.")
+        return False
+
+    print("\nСформированный пост:")
+    print(rewritten)
+
+    if not send_telegram(rewritten, image_url):
+        print("Не удалось отправить пост.")
+        return False
+
+    print("Успешно отправлено в Telegram!")
+    published.append(entry_id)
+    save_published(published)
+
+    settings = load_settings()
+    settings["last_post_time"] = time.time()
+    settings["total_posts"] = int(settings.get("total_posts", 0)) + 1
+    settings["total_tokens"] = int(settings.get("total_tokens", 0)) + int(last_usage.get("total_tokens", 0))
+    settings["manual_trigger"] = False
+    save_settings(settings)
+
+    send_log_to_admin(title, article_url)
+    return True
+
+
+if __name__ == "__main__":
+    settings = load_settings()
+    if not settings.get("interval_minutes"):
+        settings["interval_minutes"] = 60
+        save_settings(settings)
+
+    while True:
+        process_admin_commands()
+
+        settings = load_settings()
+        interval_minutes = max(1, int(settings.get("interval_minutes", 60)))
+        last_post_time = settings.get("last_post_time")
+        manual_trigger = bool(settings.get("manual_trigger", False))
+
+        should_post = manual_trigger
+        if not should_post and last_post_time is None:
+            should_post = True
+        elif not should_post and last_post_time is not None:
+            should_post = (time.time() - float(last_post_time)) >= (interval_minutes * 60)
+
+        if should_post:
+            publish_news_once()
+
+        time.sleep(min(15, max(5, interval_minutes * 60 / 4)))
