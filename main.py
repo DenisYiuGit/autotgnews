@@ -363,12 +363,33 @@ def generate_ai_image(prompt):
     if not cleaned:
         cleaned = "news"
 
-    url = f"https://image.pollinations.ai/prompt/{quote(cleaned)}"
+    news_keywords = [w for w in re.split(r"[^A-Za-z0-9]+", cleaned) if w][:5]
+    theme_keywords = " ".join(news_keywords) if news_keywords else "technology business news"
+
+    if any(word in cleaned.lower() for word in ["it", "tech", "ai", "startup", "server", "cloud", "cyber", "software", "data", "app"]):
+        visual_style = "abstract server racks, cloud architecture, digital graphs, futuristic minimal interface, geometric lines, modern technology background"
+    elif any(word in cleaned.lower() for word in ["fire", "explosion", "accident", "crash", "disaster", "blast", "storm", "collapse", "evacuation", "incident"]):
+        visual_style = "neutral disaster mood, smoke, distant buildings, hazy skyline, subdued sky tones, restrained cinematic background"
+    elif any(word in cleaned.lower() for word in ["politic", "election", "conflict", "war", "government", "diplomacy", "sanction", "parliament", "leader"]):
+        visual_style = "abstract geopolitical composition, map contours, flag colors, architecture silhouettes, modern editorial background"
+    else:
+        visual_style = "clean modern editorial background, abstract technology shapes, geometric composition, minimal business visual"
+
+    generated_prompt = (
+        f"{theme_keywords}, {visual_style}, "
+        "Professional news illustration, modern minimalistic graphic design, abstract technology background, "
+        "no people, no humans, no faces, no bodies, no portraits, no text, clean composition, 4k, "
+        "Strictly no people, no humans, no faces, no bodies, no hands, no limbs, no text overlay, "
+        "abstract and neutral, polished editorial, high detail, realistic lighting, refined composition"
+    )
+
+    encoded_prompt = quote(generated_prompt)
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
     try:
-        response = requests.post(url, timeout=45)
+        response = requests.get(url, timeout=45)
         if response.status_code in (200, 201):
             final_url = response.url or url
-            if final_url.startswith("http"):
+            if final_url.startswith("http") and "face" not in final_url.lower() and "people" not in final_url.lower():
                 return final_url
         return None
     except Exception as e:
@@ -417,7 +438,7 @@ def get_fallback_image_url(title="", source_url=""):
     if ai_generated:
         return ai_generated
 
-    return "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?auto=format&fit=crop&w=1200&q=80"
+    return "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?auto=format&fit=crop&w=1200&q=80&sat=-10"
 
 # ============================================================
 # БЕЗОПАСНЫЙ TELEGRAM HTML
