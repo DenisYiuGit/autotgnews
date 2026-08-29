@@ -6,6 +6,7 @@ import re
 import json
 import html
 import time
+import threading
 import datetime
 import random
 from urllib.parse import quote
@@ -18,6 +19,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 LAST_TELEGRAM_UPDATE_ID = 0
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
+PUBLISHED_LOCK = threading.Lock()
 
 # ============================================================
 # НАСТРОЙКИ
@@ -64,6 +66,8 @@ def load_settings():
         "total_posts": 0,
         "total_tokens": 0,
         "manual_trigger": False,
+        "manual_post_done": False,
+        "last_processed_update_id": 0,
     }
     if not os.path.exists(SETTINGS_PATH):
         save_settings(default_settings)
@@ -161,18 +165,30 @@ selected_model = select_model()
 # ============================================================
 
 def load_published():
-    if os.path.exists("published.json"):
-        try:
-            with open("published.json", "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Ошибка чтения published.json: {e}")
-            return []
-    return []
+    with PUBLISHED_LOCK:
+        if os.path.exists("published.json"):
+            try:
+                with open("published.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Ошибка чтения published.json: {e}")
+                return []
+        return []
+
 
 def save_published(published_list):
-    with open("published.json", "w", encoding="utf-8") as f:
-        json.dump(published_list, f, ensure_ascii=False, indent=2)
+    for attempt in range(3):
+        try:
+            with PUBLISHED_LOCK:
+                with open("published.json", "w", encoding="utf-8") as f:
+                    json.dump(published_list, f, ensure_ascii=False, indent=2)
+            print("Статистика опубликована успешно")
+            return True
+        except Exception as e:
+            print(f"Ошибка записи published.json (попытка {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(5)
+    return False
 
 # ============================================================
 # TEXT CLEANING
@@ -667,30 +683,46 @@ def get_admin_chat_id():
         return None
 
 
-def process_admin_commands():
+def process_updates():
     global LAST_TELEGRAM_UPDATE_ID
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return False
     admin_id = get_admin_chat_id()
     if admin_id is None:
-        return
+        return False
+
+    settings = load_settings()
+    last_processed = int(settings.get("last_processed_update_id", 0) or 0)
+    LAST_TELEGRAM_UPDATE_ID = last_processed
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     try:
-        response = requests.get(url, params={"timeout": 5, "limit": 20, "offset": LAST_TELEGRAM_UPDATE_ID + 1}, timeout=20)
+        response = requests.get(
+            url,
+            params={"timeout": 5, "limit": 20, "offset": last_processed + 1},
+            timeout=20,
+        )
         response.raise_for_status()
         updates = response.json().get("result", [])
     except Exception as e:
         print(f"Ошибка получения обновлений Telegram: {e}")
-        return
+        return False
+
+    if not updates:
+        return False
+
+    newest_update_id = last_processed
+    processed_any = False
 
     for update in updates:
         update_id = int(update.get("update_id", 0))
-        if update_id <= LAST_TELEGRAM_UPDATE_ID:
+        if update_id <= last_processed:
             continue
-        LAST_TELEGRAM_UPDATE_ID = update_id
+        newest_update_id = max(newest_update_id, update_id)
         message = update.get("message") or update.get("edited_message")
         if not message:
             continue
+
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         user = message.get("from") or {}
@@ -701,6 +733,7 @@ def process_admin_commands():
             user_id_int = int(user_id)
         except (TypeError, ValueError):
             continue
+
         if not text or chat_id_int != admin_id or user_id_int != admin_id:
             continue
 
@@ -711,6 +744,7 @@ def process_admin_commands():
         elif command == "/post_now":
             settings = load_settings()
             settings["manual_trigger"] = True
+            settings["manual_post_done"] = True
             save_settings(settings)
             send_telegram_message(chat_id, "<b>Ручной запуск активирован.</b>")
         elif command.startswith("/set_interval"):
@@ -744,6 +778,54 @@ def process_admin_commands():
             send_telegram_message(chat_id, help_text)
         else:
             send_telegram_message(chat_id, "Неизвестная команда. Используйте /help.")
+
+        processed_any = True
+        settings = load_settings()
+        settings["last_processed_update_id"] = update_id
+        save_settings(settings)
+
+    if newest_update_id > last_processed:
+        settings = load_settings()
+        settings["last_processed_update_id"] = newest_update_id
+        save_settings(settings)
+        LAST_TELEGRAM_UPDATE_ID = newest_update_id
+
+    return processed_any
+
+
+# ============================================================
+# POSTING LOGIC
+# ============================================================
+
+def check_and_post():
+    settings = load_settings()
+    if settings.get("manual_post_done") and not settings.get("manual_trigger"):
+        settings["manual_post_done"] = False
+        save_settings(settings)
+        return False
+
+    if settings.get("manual_trigger"):
+        manual_post_done = bool(settings.get("manual_post_done", False))
+        if manual_post_done:
+            print("Ручной запуск /post_now активирован.")
+            publish_news_once()
+            settings = load_settings()
+            settings["manual_trigger"] = False
+            settings["manual_post_done"] = False
+            save_settings(settings)
+            return True
+
+    interval_minutes = max(1, int(settings.get("interval_minutes", 60)))
+    last_post_time = settings.get("last_post_time")
+    if last_post_time is None:
+        should_post = True
+    else:
+        should_post = (time.time() - float(last_post_time)) >= (interval_minutes * 60)
+
+    if should_post:
+        publish_news_once()
+        return True
+    return False
 
 
 # ============================================================
@@ -829,6 +911,8 @@ def publish_news_once():
 
         for entry in feed.entries[:5]:
             entry_id = entry.get("id") or entry.get("link")
+            if not entry_id:
+                continue
             if entry_id in published:
                 continue
             all_candidates.append(entry)
@@ -841,10 +925,18 @@ def publish_news_once():
     title = best_entry.get("title", "")
     summary = best_entry.get("summary") or best_entry.get("description") or title
     article_url = best_entry.get("link") or best_entry.get("id") or ""
+    entry_id = best_entry.get("id") or best_entry.get("link")
+
+    if article_url and article_url in published:
+        print("Статья уже есть в published.json, пропускаем дубль.")
+        return False
+    if entry_id and entry_id in published:
+        print("ID новости уже есть в published.json, пропускаем дубль.")
+        return False
+
     image_url = extract_image_url(best_entry) or get_fallback_image_url(title, article_url)
     if not image_url:
         image_url = "https://placehold.co/1200x630/png?text=News"
-    entry_id = best_entry.get("id") or best_entry.get("link")
 
     print(f"\nОбработка новости: {title}")
     rewritten = generate_rewrite(title, summary, article_url)
@@ -860,14 +952,21 @@ def publish_news_once():
         return False
 
     print("Успешно отправлено в Telegram!")
+
     published.append(entry_id)
-    save_published(published)
+    if not save_published(published):
+        print("Не удалось сохранить published.json после публикации, повторяем попытку через 5 сек...")
+        time.sleep(5)
+        if not save_published(published):
+            print("Опасно: published.json не удалось сохранить после второй попытки. Публикация остановлена, чтобы не создавать дубль.")
+            return False
 
     settings = load_settings()
     settings["last_post_time"] = time.time()
     settings["total_posts"] = int(settings.get("total_posts", 0)) + 1
     settings["total_tokens"] = int(settings.get("total_tokens", 0)) + int(last_usage.get("total_tokens", 0))
     settings["manual_trigger"] = False
+    settings["manual_post_done"] = False
     save_settings(settings)
 
     send_log_to_admin(title, article_url)
@@ -881,20 +980,6 @@ if __name__ == "__main__":
         save_settings(settings)
 
     while True:
-        process_admin_commands()
-
-        settings = load_settings()
-        interval_minutes = max(1, int(settings.get("interval_minutes", 60)))
-        last_post_time = settings.get("last_post_time")
-        manual_trigger = bool(settings.get("manual_trigger", False))
-
-        should_post = manual_trigger
-        if not should_post and last_post_time is None:
-            should_post = True
-        elif not should_post and last_post_time is not None:
-            should_post = (time.time() - float(last_post_time)) >= (interval_minutes * 60)
-
-        if should_post:
-            publish_news_once()
-
-        time.sleep(min(15, max(5, interval_minutes * 60 / 4)))
+        process_updates()
+        check_and_post()
+        time.sleep(15)

@@ -2,5 +2,8 @@
   "interval_minutes": 60,
   "last_post_time": null,
   "total_posts": 0,
-  "total_tokens": 0
+  "total_tokens": 0,
+  "manual_trigger": false,
+  "manual_post_done": false,
+  "last_processed_update_id": 0
 }
