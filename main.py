@@ -13,11 +13,6 @@ from urllib.parse import quote
 import requests
 import feedparser
 
-try:
-    from okslop import OKSLOP
-except ImportError:
-    OKSLOP = None
-
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -335,110 +330,70 @@ def extract_image_url(entry):
     return None
 
 
-def search_photo_with_okslop(query):
-    if not query or OKSLOP is None:
+def is_valid_image_url(url):
+    if not url or not isinstance(url, str):
+        return False
+    cleaned = url.strip()
+    if not cleaned.startswith(("http://", "https://")):
+        return False
+    lowered = cleaned.lower()
+    if any(token in lowered for token in ["logo", "icon", "avatar", "sprite", "emoji"]):
+        return False
+    if any(lowered.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
+        return True
+    if any(token in lowered for token in ("img", "photo", "/images/", "cdn", "news")):
+        return True
+    return False
+
+
+def find_image_in_article(article_url):
+    if not article_url or not isinstance(article_url, str):
         return None
+    article_url = article_url.strip()
+    if not article_url.startswith(("http://", "https://")):
+        return None
+
     try:
-        client = OKSLOP()
-        result = client.photos.search(query=query, per_page=3)
-        if not result or not getattr(result, "results", None):
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+        response = requests.get(article_url, headers=headers, timeout=15, allow_redirects=True)
+        if response.status_code != 200:
             return None
-        for photo in result.results:
-            urls = getattr(photo, "urls", None)
-            if not urls:
+        page = response.text
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(page, "html.parser")
+
+        candidates = []
+        for tag in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
+            value = tag.get("content") or tag.get("value")
+            if value:
+                candidates.append(value)
+        for tag in soup.select('link[rel="image_src"]'):
+            value = tag.get("href")
+            if value:
+                candidates.append(value)
+
+        selectors = ["article img", ".article img", ".content img", "main img", "body img"]
+        for selector in selectors:
+            for tag in soup.select(selector):
+                src = tag.get("src") or tag.get("data-src") or tag.get("data-original")
+                if src:
+                    candidates.append(src)
+
+        seen = set()
+        for candidate in candidates:
+            url = candidate.strip()
+            if not url or url in seen:
                 continue
-            for key in ("regular", "small", "thumb", "full"):
-                url = getattr(urls, key, None)
-                if url:
-                    return url
-    except Exception as e:
-        print(f"OKSLOP search failed: {e}")
-    return None
+            seen.add(url)
+            if url.startswith("//"):
+                url = "https:" + url
+            if is_valid_image_url(url):
+                return url
 
-
-def generate_ai_image(prompt):
-    cleaned = clean_html(prompt) or "news"
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    cleaned = cleaned[:180]
-    if not cleaned:
-        cleaned = "news"
-
-    news_keywords = [w for w in re.split(r"[^A-Za-z0-9]+", cleaned) if w][:5]
-    theme_keywords = " ".join(news_keywords) if news_keywords else "technology business news"
-
-    if any(word in cleaned.lower() for word in ["it", "tech", "ai", "startup", "server", "cloud", "cyber", "software", "data", "app"]):
-        visual_style = "abstract server racks, cloud architecture, digital graphs, futuristic minimal interface, geometric lines, modern technology background"
-    elif any(word in cleaned.lower() for word in ["fire", "explosion", "accident", "crash", "disaster", "blast", "storm", "collapse", "evacuation", "incident"]):
-        visual_style = "neutral disaster mood, smoke, distant buildings, hazy skyline, subdued sky tones, restrained cinematic background"
-    elif any(word in cleaned.lower() for word in ["politic", "election", "conflict", "war", "government", "diplomacy", "sanction", "parliament", "leader"]):
-        visual_style = "abstract geopolitical composition, map contours, flag colors, architecture silhouettes, modern editorial background"
-    else:
-        visual_style = "clean modern editorial background, abstract technology shapes, geometric composition, minimal business visual"
-
-    generated_prompt = (
-        f"{theme_keywords}, {visual_style}, "
-        "Professional news illustration, modern minimalistic graphic design, abstract technology background, "
-        "no people, no humans, no faces, no bodies, no portraits, no text, clean composition, 4k, "
-        "Strictly no people, no humans, no faces, no bodies, no hands, no limbs, no text overlay, "
-        "abstract and neutral, polished editorial, high detail, realistic lighting, refined composition"
-    )
-
-    encoded_prompt = quote(generated_prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-    try:
-        response = requests.get(url, timeout=45)
-        if response.status_code in (200, 201):
-            final_url = response.url or url
-            if final_url.startswith("http") and "face" not in final_url.lower() and "people" not in final_url.lower():
-                return final_url
         return None
     except Exception as e:
-        print(f"Pollinations image generation failed: {e}")
+        print(f"Ошибка парсинга картинки статьи: {e}")
         return None
-
-
-def get_fallback_image_url(title="", source_url=""):
-    query = clean_html(title) or "news"
-    query = re.sub(r"\s+", " ", query).strip()
-    query = re.sub(r"[^A-Za-zА-Яа-я0-9\s-]", " ", query)
-    query = query.strip() or "news"
-
-    okslop_url = search_photo_with_okslop(query)
-    if okslop_url:
-        return okslop_url
-
-    search_urls = [
-        f"https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch={quote(query)}&gsrnamespace=6&gsrlimit=1&prop=imageinfo&iiprop=url&format=json",
-        f"https://api.unsplash.com/search/photos?query={quote(query)}&per_page=1"
-    ]
-
-    for url in search_urls:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            if "unsplash.com" in url:
-                headers["Accept-Version"] = "v1"
-            response = requests.get(url, headers=headers, timeout=12)
-            if response.status_code != 200:
-                continue
-            payload = response.json()
-            if "query" in url and "pages" in payload:
-                pages = payload.get("pages", {})
-                for page in pages.values():
-                    images = page.get("imageinfo", [])
-                    if images:
-                        return images[0].get("url")
-            if "unsplash.com" in url and "results" in payload:
-                results = payload.get("results", [])
-                if results:
-                    return results[0].get("urls", {}).get("regular") or results[0].get("urls", {}).get("small")
-        except Exception:
-            continue
-
-    ai_generated = generate_ai_image(query)
-    if ai_generated:
-        return ai_generated
-
-    return "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?auto=format&fit=crop&w=1200&q=80&sat=-10"
 
 # ============================================================
 # БЕЗОПАСНЫЙ TELEGRAM HTML
@@ -640,13 +595,6 @@ def send_telegram(text, image_url=None):
         print("ОШИБКА: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не установлен!")
         return False
 
-    if image_url:
-        resolved_image_url = image_url
-    else:
-        resolved_image_url = get_fallback_image_url(text)
-    if not resolved_image_url:
-        resolved_image_url = "https://placehold.co/1200x630/png?text=News"
-
     send_message_payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -654,28 +602,31 @@ def send_telegram(text, image_url=None):
         "disable_web_page_preview": False,
     }
 
-    photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "photo": resolved_image_url,
-        "parse_mode": "HTML",
-    }
-    if len(text) <= 1024:
-        payload["caption"] = text
+    resolved_image_url = image_url.strip() if isinstance(image_url, str) else None
+    if resolved_image_url:
+        photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "photo": resolved_image_url,
+            "parse_mode": "HTML",
+        }
+        if len(text) <= 1024:
+            payload["caption"] = text
 
-    try:
-        res = requests.post(photo_url, json=payload, timeout=20)
-        if res.status_code == 200:
-            return True
-        print(f"sendPhoto error: {res.text}")
-    except Exception as e:
-        print(f"Ошибка sendPhoto: {e}")
+        try:
+            res = requests.post(photo_url, json=payload, timeout=20)
+            if res.status_code == 200:
+                return True
+            print(f"sendPhoto error: {res.text}")
+        except Exception as e:
+            print(f"Ошибка sendPhoto: {e}")
+
+        print("Картинка сломалась или недоступна, отправляем текст без фото.")
 
     message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         res = requests.post(message_url, json=send_message_payload, timeout=20)
         if res.status_code == 200:
-            print("Фото сломалось, отправка текста выполнена как fallback.")
             return True
         print(f"sendMessage fallback error: {res.text}")
     except Exception as e:
@@ -1004,57 +955,63 @@ def publish_news_once():
         print("Новых новостей не найдено.")
         return False
 
-    best_entry = max(all_candidates, key=news_score)
-    title = best_entry.get("title", "")
-    summary = best_entry.get("summary") or best_entry.get("description") or title
-    article_url = best_entry.get("link") or best_entry.get("id") or ""
-    entry_id = best_entry.get("id") or best_entry.get("link")
+    for candidate in sorted(all_candidates, key=news_score, reverse=True):
+        title = candidate.get("title", "")
+        summary = candidate.get("summary") or candidate.get("description") or title
+        article_url = candidate.get("link") or candidate.get("id") or ""
+        entry_id = candidate.get("id") or candidate.get("link")
 
-    if article_url and article_url in published:
-        print("Статья уже есть в published.json, пропускаем дубль.")
-        return False
-    if entry_id and entry_id in published:
-        print("ID новости уже есть в published.json, пропускаем дубль.")
-        return False
+        if article_url and article_url in published:
+            print("Статья уже есть в published.json, пропускаем дубль.")
+            continue
+        if entry_id and entry_id in published:
+            print("ID новости уже есть в published.json, пропускаем дубль.")
+            continue
 
-    image_url = extract_image_url(best_entry) or get_fallback_image_url(title, article_url)
-    if not image_url:
-        image_url = "https://placehold.co/1200x630/png?text=News"
+        image_url = extract_image_url(candidate) or find_image_in_article(article_url)
+        if not image_url:
+            print(f"Пропускаем новость без изображения: {title}")
+            continue
 
-    print(f"\nОбработка новости: {title}")
-    rewritten = generate_rewrite(title, summary, article_url)
-    if not rewritten:
-        print("Не удалось сгенерировать пост.")
-        return False
+        print(f"\nОбработка новости: {title}")
+        rewritten = generate_rewrite(title, summary, article_url)
+        if not rewritten:
+            print("Не удалось сгенерировать пост, пробуем следующую новость.")
+            continue
 
-    print("\nСформированный пост:")
-    print(rewritten)
+        print("\nСформированный пост:")
+        print(rewritten)
 
-    if not send_telegram(rewritten, image_url):
-        print("Не удалось отправить пост.")
-        return False
+        if not send_telegram(rewritten, image_url):
+            print("Не удалось отправить пост, пробуем следующую новость.")
+            continue
 
-    print("Успешно отправлено в Telegram!")
+        print("Успешно отправлено в Telegram!")
 
-    if entry_id not in published:
-        published.append(entry_id)
-    if not save_published(published):
-        print("Не удалось сохранить published.json после публикации, повторяем попытку через 5 сек...")
-        time.sleep(5)
+        if entry_id not in published:
+            published.append(entry_id)
         if not save_published(published):
-            print("Опасно: published.json не удалось сохранить после второй попытки. Публикация остановлена, чтобы не создавать дубль.")
-            return False
+            print("Не удалось сохранить published.json после публикации, повторяем попытку через 5 сек...")
+            time.sleep(5)
+            if not save_published(published):
+                print("Опасно: published.json не удалось сохранить после второй попытки. Публикация остановлена, чтобы не создавать дубль.")
+                return False
 
-    settings = load_settings()
-    settings["last_post_time"] = time.time()
-    settings["total_posts"] = int(settings.get("total_posts", 0)) + 1
-    settings["total_tokens"] = int(settings.get("total_tokens", 0)) + int(last_usage.get("total_tokens", 0))
-    settings["manual_trigger"] = False
-    settings["manual_post_done"] = False
-    save_settings(settings)
+        print("Статистика опубликована успешно")
 
-    send_log_to_admin(title, article_url)
-    return True
+        settings = load_settings()
+        settings["last_post_time"] = time.time()
+        settings["total_posts"] = int(settings.get("total_posts", 0)) + 1
+        settings["total_tokens"] = int(settings.get("total_tokens", 0)) + int(last_usage.get("total_tokens", 0))
+        settings["manual_trigger"] = False
+        settings["manual_post_done"] = False
+        save_settings(settings)
+
+        send_log_to_admin(title, article_url)
+        return True
+
+    print("Подходящих новостей с картинкой не найдено.")
+    return False
 
 
 if __name__ == "__main__":
