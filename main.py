@@ -13,6 +13,11 @@ from urllib.parse import quote
 import requests
 import feedparser
 
+try:
+    from okslop import OKSLOP
+except ImportError:
+    OKSLOP = None
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -330,11 +335,56 @@ def extract_image_url(entry):
     return None
 
 
+def search_photo_with_okslop(query):
+    if not query or OKSLOP is None:
+        return None
+    try:
+        client = OKSLOP()
+        result = client.photos.search(query=query, per_page=3)
+        if not result or not getattr(result, "results", None):
+            return None
+        for photo in result.results:
+            urls = getattr(photo, "urls", None)
+            if not urls:
+                continue
+            for key in ("regular", "small", "thumb", "full"):
+                url = getattr(urls, key, None)
+                if url:
+                    return url
+    except Exception as e:
+        print(f"OKSLOP search failed: {e}")
+    return None
+
+
+def generate_ai_image(prompt):
+    cleaned = clean_html(prompt) or "news"
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned[:180]
+    if not cleaned:
+        cleaned = "news"
+
+    url = f"https://image.pollinations.ai/prompt/{quote(cleaned)}"
+    try:
+        response = requests.post(url, timeout=45)
+        if response.status_code in (200, 201):
+            final_url = response.url or url
+            if final_url.startswith("http"):
+                return final_url
+        return None
+    except Exception as e:
+        print(f"Pollinations image generation failed: {e}")
+        return None
+
+
 def get_fallback_image_url(title="", source_url=""):
     query = clean_html(title) or "news"
     query = re.sub(r"\s+", " ", query).strip()
     query = re.sub(r"[^A-Za-zА-Яа-я0-9\s-]", " ", query)
     query = query.strip() or "news"
+
+    okslop_url = search_photo_with_okslop(query)
+    if okslop_url:
+        return okslop_url
 
     search_urls = [
         f"https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch={quote(query)}&gsrnamespace=6&gsrlimit=1&prop=imageinfo&iiprop=url&format=json",
@@ -363,7 +413,11 @@ def get_fallback_image_url(title="", source_url=""):
         except Exception:
             continue
 
-    return "https://placehold.co/1200x630/png?text=News"
+    ai_generated = generate_ai_image(query)
+    if ai_generated:
+        return ai_generated
+
+    return "https://images.unsplash.com/photo-1493246507139-91e8fad9978e?auto=format&fit=crop&w=1200&q=80"
 
 # ============================================================
 # БЕЗОПАСНЫЙ TELEGRAM HTML
