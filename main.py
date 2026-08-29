@@ -7,6 +7,7 @@ import json
 import html
 import datetime
 import random
+from urllib.parse import quote
 import requests
 import feedparser
 
@@ -36,6 +37,21 @@ def sanitize_channel_link(raw_link):
 TELEGRAM_CHANNEL_LINK = sanitize_channel_link(
     os.environ.get("TELEGRAM_CHANNEL_LINK", "")
 )
+TELEGRAM_CHANNEL_NAME = (
+    os.environ.get("TELEGRAM_CHANNEL_NAME")
+    or os.environ.get("TELEGRAM_CHANNEL_LINK")
+    or "⚡️ Наша Раша"
+).strip()
+if not TELEGRAM_CHANNEL_NAME:
+    TELEGRAM_CHANNEL_NAME = "⚡️ Наша Раша"
+if TELEGRAM_CHANNEL_NAME.startswith("https://") or TELEGRAM_CHANNEL_NAME.startswith("http://"):
+    TELEGRAM_CHANNEL_NAME = "⚡️ Наша Раша"
+if not TELEGRAM_CHANNEL_NAME.startswith("⚡️") and not TELEGRAM_CHANNEL_NAME.startswith("@"):
+    TELEGRAM_CHANNEL_NAME = f"⚡️ {TELEGRAM_CHANNEL_NAME}"
+if TELEGRAM_CHANNEL_LINK and "@" not in TELEGRAM_CHANNEL_NAME and "Наша Раша" not in TELEGRAM_CHANNEL_NAME:
+    default_slug = TELEGRAM_CHANNEL_LINK.rstrip("/").split("/")[-1]
+    if default_slug:
+        TELEGRAM_CHANNEL_NAME = f"⚡️ {default_slug}"
 
 # Расширенный список RSS-лент (новости, экономика, IT)
 RSS_FEEDS = [
@@ -265,6 +281,42 @@ def extract_image_url(entry):
         return match.group(0)
     return None
 
+
+def get_fallback_image_url(title="", source_url=""):
+    query = clean_html(title) or "news"
+    query = re.sub(r"\s+", " ", query).strip()
+    query = re.sub(r"[^A-Za-zА-Яа-я0-9\s-]", " ", query)
+    query = query.strip() or "news"
+
+    search_urls = [
+        f"https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch={quote(query)}&gsrnamespace=6&gsrlimit=1&prop=imageinfo&iiprop=url&format=json",
+        f"https://api.unsplash.com/search/photos?query={quote(query)}&per_page=1"
+    ]
+
+    for url in search_urls:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            if "unsplash.com" in url:
+                headers["Accept-Version"] = "v1"
+            response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            if "query" in url and "pages" in payload:
+                pages = payload.get("pages", {})
+                for page in pages.values():
+                    images = page.get("imageinfo", [])
+                    if images:
+                        return images[0].get("url")
+            if "unsplash.com" in url and "results" in payload:
+                results = payload.get("results", [])
+                if results:
+                    return results[0].get("urls", {}).get("regular") or results[0].get("urls", {}).get("small")
+        except Exception:
+            continue
+
+    return "https://placehold.co/1200x630/png?text=News"
+
 # ============================================================
 # БЕЗОПАСНЫЙ TELEGRAM HTML
 # ============================================================
@@ -332,71 +384,30 @@ def generate_rewrite(title, summary, article_url):
     if not clean_title and not clean_summary:
         return None
 
-    article_text = extract_article_text(article_url)
-    if article_text:
-        source_text = article_text
-        print(f"Полный текст статьи получен: {len(article_text)} символов")
-    else:
-        source_text = clean_summary
-        print("Полный текст не получен. Используется RSS summary.")
+    source_text = clean_summary or clean_title or ""
+    if source_text:
+        source_text = source_text[:3000]
+        print(f"Используется краткое описание RSS: {len(source_text)} символов")
 
     if not source_text:
         source_text = clean_title
-    source_text = source_text[:18000]
+    source_text = source_text[:3000]
 
     prompt = f"""
-Ты — редактор новостного Telegram-канала «Наша Раша».
+Ты — редактор новостного Telegram-канала.
+Твоя задача: сделать короткий, ясный пост по фактам из материала ниже.
 
-Тебе нужно подготовить короткий новостной пост ИСКЛЮЧИТЕЛЬНО на основании предоставленного материала.
+Правила:
+- Пиши только по исходному материалу. Никаких домыслов и новых деталей.
+- Сохраняй главный факт новости.
+- title: короткий заголовок без повторения исходника.
+- info: 1-2 коротких абзаца по сути события.
+- comment: короткий комментарий канала, саркастичный, едкий или ироничный, напрямую связан с фактом. Не аналитика и не мнение от первого лица. Без воды и общих фраз.
+- Не используй HTML, эмодзи, ссылки, подпись канала.
+- Верни только валидный JSON: {"title": "...", "info": "...", "comment": "..."}
 
-ГЛАВНЫЙ ПРИНЦИП:
-никаких выдумок, предположений, оценок и информации, которой нет в исходном материале.
-
-ЗАГОЛОВОК:
-Сделай короткий заголовок, передающий главный факт.
-Не добавляй новые сведения.
-Заголовок должен отличаться от исходного, но смысл должен остаться тем же.
-
-ИНФОРМАЦИЯ:
-Напиши 1–2 коротких абзаца.
-Здесь нужна КОНКРЕТИКА из новости:
-кто, где, когда, что произошло, чем закончилось — но только если это есть в исходном материале.
-
-КАТЕГОРИЧЕСКИ НЕ НАДО:
-- повторять заголовок;
-- пересказывать всю статью;
-- добавлять очевидные или придуманные выводы;
-- писать общие фразы ради объёма.
-
-КОММЕНТАРИЙ:
-Напиши короткую авторскую реплику для Telegram-канала.
-Она должна быть непосредственно связана с фактами новости.
-Это НЕ новый факт и НЕ аналитический вывод, требующий дополнительной информации.
-
-Комментарий может быть эмоциональным или разговорным, но не должен выдумывать обстоятельства.
-
-Примеры допустимого направления:
-«Вот так и заканчивается попытка разобраться самому.»
-«Опасный предмет лучше вообще не трогать.»
-«Трагичный исход обычной, на первый взгляд, ситуации.»
-
-Если исходный материал слишком короткий и для комментария не хватает оснований — сделай максимально нейтральную реплику, связанную с описанным событием.
-
-ВАЖНО:
-Не используй HTML.
-Не используй эмодзи.
-Не добавляй ссылки.
-Не добавляй подпись канала.
-Верни ТОЛЬКО валидный JSON без каких-либо пояснений, размышлений, тегов `<think>` или Markdown.
-
-Вот формат:
-{{"title": "заголовок", "info": "информация", "comment": "комментарий"}}
-
-ЗАГОЛОВОК ИЗ RSS:
-{clean_title}
-
-МАТЕРИАЛ НОВОСТИ:
-{source_text}
+Заголовок из RSS: {clean_title}
+Материал: {source_text}
 """
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -443,7 +454,7 @@ def generate_rewrite(title, summary, article_url):
             else:
                 # совсем ничего нет — используем оригинал
                 print("Не удалось извлечь поля, используем исходные title/summary.")
-                data = {'title': clean_title, 'info': clean_summary, 'comment': 'Вот такая история.'}
+                data = {'title': clean_title, 'info': clean_summary, 'comment': ''}
 
         ai_title = str(data.get("title", "")).strip()
         ai_info = str(data.get("info", "")).strip()
@@ -455,7 +466,7 @@ def generate_rewrite(title, summary, article_url):
         if not ai_info or ai_info == "..." or len(ai_info) < 10:
             ai_info = clean_summary
         if not ai_comment or ai_comment == "..." or len(ai_comment) < 3:
-            ai_comment = "Вот такая история."
+            ai_comment = "Какой день, такой и вечер."
 
         # Дополнительная очистка HTML
         ai_title = clean_html(ai_title)
@@ -473,16 +484,17 @@ def generate_rewrite(title, summary, article_url):
 
         safe_article_url = html.escape(article_url or "", quote=True)
         safe_channel_url = html.escape(TELEGRAM_CHANNEL_LINK, quote=True)
+        safe_channel_name = html.escape(TELEGRAM_CHANNEL_NAME)
 
         parts = []
         parts.append(f"⚡️ <b>{safe_title}</b>")
         if safe_info:
             parts.append(safe_info)
-        if safe_comment:
+        if safe_comment and safe_comment != "Какой день, такой и вечер.":
             parts.append(f"💬 <i>{safe_comment}</i>")
         if safe_article_url:
             parts.append(f'👉 <a href="{safe_article_url}">Читать источник</a>')
-        parts.append(f'<a href="{safe_channel_url}">⚡️ Наша Раша | @nasharusa</a>')
+        parts.append(f'<a href="{safe_channel_url}">{safe_channel_name}</a>')
 
         return "\n\n".join(parts)
 
@@ -499,50 +511,45 @@ def send_telegram(text, image_url=None):
         print("ОШИБКА: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не установлен!")
         return False
 
-    if image_url:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        if len(text) <= 1024:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "photo": image_url,
-                "caption": text,
-                "parse_mode": "HTML"
-            }
-            try:
-                res = requests.post(url, json=payload, timeout=20)
-                if res.status_code == 200:
-                    return True
-                print(f"sendPhoto error: {res.text}")
-            except Exception as e:
-                print(f"Ошибка sendPhoto: {e}")
-        else:
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "photo": image_url
-            }
-            try:
-                res = requests.post(url, json=payload, timeout=20)
-                if res.status_code == 200:
-                    return send_telegram(text, image_url=None)
-                print(f"sendPhoto error: {res.text}")
-            except Exception as e:
-                print(f"Ошибка sendPhoto: {e}")
+    resolved_image_url = image_url or get_fallback_image_url(text)
+    if not resolved_image_url:
+        resolved_image_url = "https://placehold.co/1200x630/png?text=News"
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "photo": resolved_image_url,
+        "parse_mode": "HTML"
     }
+
+    if len(text) <= 1024:
+        payload["caption"] = text
+
     try:
         res = requests.post(url, json=payload, timeout=20)
-        if res.status_code != 200:
-            print(f"sendMessage error: {res.text}")
-        return res.status_code == 200
+        if res.status_code == 200:
+            return True
+        print(f"sendPhoto error: {res.text}")
     except Exception as e:
-        print(f"Ошибка sendMessage: {e}")
-        return False
+        print(f"Ошибка sendPhoto: {e}")
+
+    if len(text) > 1024:
+        fallback_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        fallback_payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        }
+        try:
+            fallback_res = requests.post(fallback_url, json=fallback_payload, timeout=20)
+            if fallback_res.status_code == 200:
+                return True
+            print(f"sendMessage fallback error: {fallback_res.text}")
+        except Exception as e:
+            print(f"Ошибка sendMessage fallback: {e}")
+
+    return False
 
 # ============================================================
 # LOG TO ADMIN
@@ -692,7 +699,9 @@ if __name__ == "__main__":
     title = best_entry.get("title", "")
     summary = best_entry.get("summary") or best_entry.get("description") or title
     article_url = best_entry.get("link") or best_entry.get("id") or ""
-    image_url = extract_image_url(best_entry)
+    image_url = extract_image_url(best_entry) or get_fallback_image_url(title, article_url)
+    if not image_url:
+        image_url = "https://placehold.co/1200x630/png?text=News"
     entry_id = best_entry.get("id") or best_entry.get("link")
 
     print(f"\nОбработка новости: {title}")
