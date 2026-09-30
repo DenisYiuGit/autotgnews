@@ -9,9 +9,18 @@ import time
 import threading
 import datetime
 import random
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 import requests
 import feedparser
+
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -307,26 +316,28 @@ def extract_article_text(article_url):
 # IMAGE
 # ============================================================
 
+IMAGE_ACCEPT = (
+    "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+)
+
+IMAGE_MIN_BYTES = 15000
+IMAGE_MIN_SIDE = 300
+IMAGE_MAX_BYTES = 15 * 1024 * 1024
+IMAGE_TIMEOUT = 15
+
+BAD_IMAGE_TOKENS = (
+    "logo", "icon", "avatar", "sprite", "emoji", "placeholder",
+    "blank", "spacer", "favicon", "1x1", "/pixel", "pixel.gif",
+    "watermark", "noimage", "no_image", "no-image", "default_img",
+)
+
+
 def extract_image_url(entry):
-    if "enclosures" in entry:
-        for enc in entry.enclosures:
-            if enc.get("type", "").startswith("image"):
-                return enc.get("href")
-    if "media_content" in entry:
-        for media in entry.media_content:
-            if media.get("medium") == "image" or "url" in media:
-                return media.get("url")
-    if "media_thumbnail" in entry and len(entry.media_thumbnail) > 0:
-        return entry.media_thumbnail[0].get("url")
-    content = entry.get("summary", "")
-    if "content" in entry and len(entry.content) > 0:
-        content += " " + entry.content[0].get("value", "")
-    match = re.search(
-        r"https?://[^\s'\"]+\.(?:jpg|jpeg|png|webp)",
-        content, re.IGNORECASE
-    )
-    if match:
-        return match.group(0)
+    """Быстрый способ достать ссылку на картинку из RSS-записи (без сети)."""
+    candidates = collect_entry_image_urls(entry)
+    for candidate in candidates:
+        if is_valid_image_url(candidate):
+            return candidate
     return None
 
 
@@ -337,63 +348,440 @@ def is_valid_image_url(url):
     if not cleaned.startswith(("http://", "https://")):
         return False
     lowered = cleaned.lower()
-    if any(token in lowered for token in ["logo", "icon", "avatar", "sprite", "emoji"]):
+    if any(token in lowered for token in BAD_IMAGE_TOKENS):
         return False
     if any(lowered.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")):
         return True
-    if any(token in lowered for token in ("img", "photo", "/images/", "cdn", "news")):
+    if any(token in lowered for token in ("img", "photo", "/images/", "cdn", "news", "media")):
         return True
     return False
 
 
-def find_image_in_article(article_url):
-    if not article_url or not isinstance(article_url, str):
+def normalize_image_url(raw_url, base_url=None):
+    """Приводит ссылку к абсолютному http(s)-виду. data:-URI и мусор отбрасывает."""
+    if not raw_url or not isinstance(raw_url, str):
         return None
-    article_url = article_url.strip()
-    if not article_url.startswith(("http://", "https://")):
+    url = raw_url.strip().replace("&amp;", "&")
+    if not url or url.startswith("data:") or url.startswith("blob:"):
+        return None
+    if url.startswith("//"):
+        url = "https:" + url
+    if url.startswith(("http://", "https://")):
+        return url
+    if base_url:
+        try:
+            return urljoin(base_url, url)
+        except Exception:
+            return None
+    return None
+
+
+# --- разбор размеров картинки по сигнатуре файла (без внешних библиотек) ---
+
+def _png_size(data):
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return None
+
+
+def _gif_size(data):
+    if len(data) >= 10 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+    return None
+
+
+def _jpeg_size(data):
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    sof_markers = (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                   0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+    index = 2
+    total = len(data)
+    while index + 4 <= total:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        if marker == 0xD9:
+            return None
+        seg_len = int.from_bytes(data[index + 2:index + 4], "big")
+        if marker in sof_markers:
+            if index + 9 > total:
+                return None
+            return (
+                int.from_bytes(data[index + 7:index + 9], "big"),
+                int.from_bytes(data[index + 5:index + 7], "big"),
+            )
+        if seg_len < 2:
+            return None
+        index += 2 + seg_len
+    return None
+
+
+def _webp_size(data):
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk = data[12:16]
+    if chunk == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+        return (
+            int.from_bytes(data[26:28], "little") & 0x3FFF,
+            int.from_bytes(data[28:30], "little") & 0x3FFF,
+        )
+    if chunk == b"VP8L" and data[20] == 0x2F:
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if chunk == b"VP8X":
+        return (
+            1 + int.from_bytes(data[24:27], "little"),
+            1 + int.from_bytes(data[27:30], "little"),
+        )
+    return None
+
+
+def _bmp_size(data):
+    if len(data) >= 26 and data[:2] == b"BM":
+        return int.from_bytes(data[18:22], "little"), int.from_bytes(data[22:26], "little")
+    return None
+
+
+def _avif_size(data):
+    if len(data) < 16 or data[4:8] != b"ftyp":
+        return None
+    if data[8:12] not in (b"avif", b"avis", b"av01", b"mif1", b"msf1"):
+        return None
+    index = 0
+    total = len(data)
+    while index + 8 <= total:
+        box_size = int.from_bytes(data[index:index + 4], "big")
+        box_type = data[index + 4:index + 8]
+        if box_size < 8:
+            break
+        if box_type == b"ispe" and index + 20 <= total:
+            return (
+                int.from_bytes(data[index + 12:index + 16], "big"),
+                int.from_bytes(data[index + 16:index + 20], "big"),
+            )
+        index += box_size
+    return None
+
+
+def _image_size_with_pillow(data):
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            width, height = opened.size
+        if width and height:
+            return int(width), int(height)
+    except Exception:
+        return None
+    return None
+
+
+def image_dimensions(data):
+    """Возвращает (ширина, высота) по сигнатуре файла либо через Pillow."""
+    for parser in (_png_size, _jpeg_size, _gif_size, _webp_size, _avif_size, _bmp_size):
+        try:
+            size = parser(data)
+        except Exception:
+            size = None
+        if size:
+            return size
+    return _image_size_with_pillow(data)
+
+
+def _image_is_blank_with_pillow(data):
+    """True — картинка почти одноцветная (пустая/белая). None — проверить нечем."""
+    try:
+        import io
+        from PIL import Image, ImageStat
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as opened:
+            small = opened.convert("RGB").resize((32, 32))
+            stddev = sum(ImageStat.Stat(small).stddev) / 3.0
+            gray = list(small.convert("L").getdata())
+            mean = sum(gray) / len(gray)
+        solid = stddev < 3.0
+        near_white = mean > 245 and stddev < 8.0
+        return bool(solid or near_white)
+    except Exception:
+        return None
+
+
+def _image_is_blank_heuristic(data, width, height):
+    """Запасная проверка без Pillow: однотонная картинка сжимается почти в ноль."""
+    pixels = width * height
+    if pixels <= 0:
+        return False
+    return (len(data) / float(pixels)) < 0.02
+
+
+def fetch_and_check_image(url):
+    """Скачивает картинку и проверяет, что она настоящая и не пустая.
+    Возвращает байты картинки или None."""
+    if not is_valid_image_url(url):
+        return None
+
+    headers = dict(BROWSER_HEADERS)
+    headers["Accept"] = IMAGE_ACCEPT
+    try:
+        response = requests.get(url, headers=headers, timeout=IMAGE_TIMEOUT, stream=True)
+    except Exception as e:
+        print(f"Не удалось скачать картинку: {e}")
         return None
 
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-        response = requests.get(article_url, headers=headers, timeout=15, allow_redirects=True)
         if response.status_code != 200:
+            print(f"Картинка вернула HTTP {response.status_code}")
             return None
+
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type.startswith("text/") or content_type in (
+            "application/json", "application/xml", "application/javascript"
+        ):
+            print(f"По ссылке отдаётся не картинка, а {content_type}")
+            return None
+
+        declared = response.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > IMAGE_MAX_BYTES:
+            print("Картинка слишком большая, пропускаем")
+            return None
+
+        data = response.content
+    finally:
+        response.close()
+
+    if not data or len(data) < IMAGE_MIN_BYTES:
+        size = len(data) if data else 0
+        print(f"Картинка слишком маленькая ({size} байт) — похоже на заглушку")
+        return None
+
+    size = image_dimensions(data)
+    if not size:
+        print("Не удалось распознать формат картинки, пропускаем")
+        return None
+
+    width, height = size
+    if width < IMAGE_MIN_SIDE or height < IMAGE_MIN_SIDE:
+        print(f"Картинка слишком маленькая ({width}x{height}), пропускаем")
+        return None
+
+    blank = _image_is_blank_with_pillow(data)
+    if blank is None:
+        blank = _image_is_blank_heuristic(data, width, height)
+    if blank:
+        print("Картинка пустая или одноцветная, пропускаем")
+        return None
+
+    return data
+
+
+def _pick_best_srcset(srcset):
+    """Из srcset выбирает самую крупную картинку."""
+    best = None
+    best_weight = -1
+    for part in str(srcset).split(","):
+        pieces = part.strip().split()
+        if not pieces:
+            continue
+        weight = 0
+        if len(pieces) > 1:
+            descriptor = pieces[1].lower()
+            match = re.match(r"^([\d.]+)(w|x)$", descriptor)
+            if match:
+                value = float(match.group(1))
+                weight = value if match.group(2) == "w" else value * 1000
+        if weight >= best_weight:
+            best_weight = weight
+            best = pieces[0]
+    return [best] if best else []
+
+
+def _entry_get(entry, key, default=None):
+    """Читает поле RSS-записи, работает и с dict, и с объектом feedparser."""
+    if entry is None:
+        return default
+    try:
+        value = entry.get(key, default)
+    except AttributeError:
+        value = getattr(entry, key, default)
+    return default if value is None else value
+
+
+def collect_entry_image_urls(entry):
+    """Ссылки на картинки из RSS-записи: enclosures, media, og внутри summary."""
+    urls = []
+    for enc in _entry_get(entry, "enclosures", []) or []:
+        if str(_entry_get(enc, "type", "")).startswith("image"):
+            href = _entry_get(enc, "href") or _entry_get(enc, "url")
+            if href:
+                urls.append(href)
+
+    for media in _entry_get(entry, "media_content", []) or []:
+        if _entry_get(media, "medium") == "image" or _entry_get(media, "url"):
+            media_url = _entry_get(media, "url")
+            if media_url:
+                urls.append(media_url)
+
+    for thumb in _entry_get(entry, "media_thumbnail", []) or []:
+        thumb_url = _entry_get(thumb, "url")
+        if thumb_url:
+            urls.append(thumb_url)
+
+    content = _entry_get(entry, "summary", "") or ""
+    for block in _entry_get(entry, "content", []) or []:
+        content += " " + (_entry_get(block, "value", "") or "")
+    for meta in _entry_get(entry, "summary_detail", []) or []:
+        content += " " + str(_entry_get(meta, "value", "") or "")
+
+    urls.extend(re.findall(
+        r"https?://[^\s'\"<>]+/[^<>]*?\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^<>]*)?",
+        content, re.IGNORECASE
+    ))
+    return urls
+
+
+def _collect_jsonld_images(page):
+    urls = []
+
+    def walk(node, depth=0):
+        if depth > 4:
+            return
+        if isinstance(node, dict):
+            for key in ("image", "thumbnailUrl", "contentUrl"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    urls.append(value)
+                elif isinstance(value, dict):
+                    url = value.get("url")
+                    if isinstance(url, str):
+                        urls.append(url)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            urls.append(item)
+                        elif isinstance(item, dict) and isinstance(item.get("url"), str):
+                            urls.append(item["url"])
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    for raw_json in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        page, flags=re.IGNORECASE | re.DOTALL
+    ):
+        try:
+            walk(json.loads(raw_json.strip()))
+        except Exception:
+            continue
+    return urls
+
+
+def collect_article_image_urls(article_url):
+    """Ссылки на картинки со страницы статьи, от лучших к худшим."""
+    if not article_url or not isinstance(article_url, str):
+        return []
+    article_url = article_url.strip()
+    if not article_url.startswith(("http://", "https://")):
+        return []
+
+    try:
+        response = requests.get(
+            article_url, headers=BROWSER_HEADERS, timeout=15, allow_redirects=True
+        )
+        if response.status_code != 200:
+            return []
+        response.encoding = response.apparent_encoding or "utf-8"
         page = response.text
+    except Exception as e:
+        print(f"Ошибка загрузки страницы статьи: {e}")
+        return []
+
+    urls = []
+    try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(page, "html.parser")
 
-        candidates = []
-        for tag in soup.select('meta[property="og:image"], meta[name="twitter:image"]'):
-            value = tag.get("content") or tag.get("value")
-            if value:
-                candidates.append(value)
-        for tag in soup.select('link[rel="image_src"]'):
-            value = tag.get("href")
-            if value:
-                candidates.append(value)
-
-        selectors = ["article img", ".article img", ".content img", "main img", "body img"]
-        for selector in selectors:
+        meta_selectors = [
+            'meta[property="og:image:secure_url"]',
+            'meta[property="og:image:url"]',
+            'meta[property="og:image"]',
+            'meta[name="twitter:image"]',
+            'meta[name="twitter:image:src"]',
+            'meta[itemprop="image"]',
+            'link[rel="image_src"]',
+        ]
+        for selector in meta_selectors:
             for tag in soup.select(selector):
-                src = tag.get("src") or tag.get("data-src") or tag.get("data-original")
-                if src:
-                    candidates.append(src)
+                value = tag.get("content") or tag.get("value") or tag.get("href")
+                if value:
+                    urls.append(value)
 
-        seen = set()
-        for candidate in candidates:
-            url = candidate.strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            if url.startswith("//"):
-                url = "https:" + url
-            if is_valid_image_url(url):
-                return url
-
-        return None
+        img_selectors = [
+            "article img", ".article img", ".content img", "main img",
+            "picture source", "article source", "figure img", "body img",
+        ]
+        for selector in img_selectors:
+            for tag in soup.select(selector):
+                for attribute in ("src", "data-src", "data-original",
+                                  "data-lazy-src", "data-hi-res-src", "data-srcset", "srcset"):
+                    value = tag.get(attribute)
+                    if not value:
+                        continue
+                    if "srcset" in attribute:
+                        urls.extend(_pick_best_srcset(value))
+                    else:
+                        urls.append(value)
+    except ImportError:
+        print("BeautifulSoup не установлен, картинки ищем только через og:image и JSON-LD.")
     except Exception as e:
-        print(f"Ошибка парсинга картинки статьи: {e}")
+        print(f"Ошибка парсинга HTML статьи: {e}")
+
+    urls.extend(_collect_jsonld_images(page))
+    return urls
+
+
+def resolve_image_urls(entry, article_url):
+    """Полный упорядоченный список ссылок на картинки: из RSS и со страницы статьи."""
+    seen = set()
+    ordered = []
+    raw_urls = collect_entry_image_urls(entry)
+    raw_urls.extend(collect_article_image_urls(article_url))
+    for raw in raw_urls:
+        url = normalize_image_url(raw, article_url)
+        if not url or not is_valid_image_url(url):
+            continue
+        key = url.split("#")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(url)
+    return ordered
+
+
+def pick_valid_image(image_urls):
+    """Перебирает ссылки и возвращает первую реально пригодную картинку."""
+    if not image_urls:
+        print("Ни в RSS, ни на странице статьи картинка не нашлась.")
         return None
+    print(f"Кандидатов на картинку: {len(image_urls)}")
+    for url in image_urls:
+        if fetch_and_check_image(url):
+            print(f"Картинка подходит: {url}")
+            return url
+        print("Картинка не подходит, пробуем следующую кандидатуру.")
+    return None
+
 
 # ============================================================
 # БЕЗОПАСНЫЙ TELEGRAM HTML
@@ -590,21 +978,24 @@ def generate_rewrite(title, summary, article_url):
 # TELEGRAM SENDING
 # ============================================================
 
-def send_telegram(text, image_url=None):
+def send_telegram(text, image_urls=None):
+    """Отправляет пост строго с картинкой.
+    Без картинки и при неудаче со всеми картинками возвращает False —
+    вызывающий код берёт другую новость."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("ОШИБКА: TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не установлен!")
         return False
 
-    send_message_payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+    if isinstance(image_urls, str):
+        image_urls = [image_urls]
+    image_urls = [url for url in (image_urls or []) if isinstance(url, str) and url.strip()]
+    if not image_urls:
+        print("Нет ни одной подходящей картинки, пост не отправляем.")
+        return False
 
-    resolved_image_url = image_url.strip() if isinstance(image_url, str) else None
-    if resolved_image_url:
-        photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    photo_endpoint = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    for image_url in image_urls:
+        resolved_image_url = image_url.strip()
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "photo": resolved_image_url,
@@ -614,24 +1005,16 @@ def send_telegram(text, image_url=None):
             payload["caption"] = text
 
         try:
-            res = requests.post(photo_url, json=payload, timeout=20)
+            res = requests.post(photo_endpoint, json=payload, timeout=20)
             if res.status_code == 200:
                 return True
             print(f"sendPhoto error: {res.text}")
         except Exception as e:
             print(f"Ошибка sendPhoto: {e}")
 
-        print("Картинка сломалась или недоступна, отправляем текст без фото.")
+        print("Telegram не принял эту картинку, пробуем другую.")
 
-    message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        res = requests.post(message_url, json=send_message_payload, timeout=20)
-        if res.status_code == 200:
-            return True
-        print(f"sendMessage fallback error: {res.text}")
-    except Exception as e:
-        print(f"Ошибка sendMessage fallback: {e}")
-
+    print("Ни одна картинка не отправилась. Пост пропущен, берём другую новость.")
     return False
 
 
@@ -968,10 +1351,15 @@ def publish_news_once():
             print("ID новости уже есть в published.json, пропускаем дубль.")
             continue
 
-        image_url = extract_image_url(candidate) or find_image_in_article(article_url)
+        image_candidates = resolve_image_urls(candidate, article_url)
+        image_url = pick_valid_image(image_candidates)
         if not image_url:
-            print(f"Пропускаем новость без изображения: {title}")
+            print(f"У новости не нашлось нормальной картинки — сразу берём другую: {title}")
             continue
+
+        ordered_images = [image_url] + [
+            url for url in image_candidates if url != image_url
+        ]
 
         print(f"\nОбработка новости: {title}")
         rewritten = generate_rewrite(title, summary, article_url)
@@ -982,8 +1370,8 @@ def publish_news_once():
         print("\nСформированный пост:")
         print(rewritten)
 
-        if not send_telegram(rewritten, image_url):
-            print("Не удалось отправить пост, пробуем следующую новость.")
+        if not send_telegram(rewritten, ordered_images):
+            print("Пост с картинкой не ушёл, пробуем следующую новость.")
             continue
 
         print("Успешно отправлено в Telegram!")
