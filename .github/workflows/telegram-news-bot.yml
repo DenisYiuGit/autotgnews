@@ -11,7 +11,10 @@ concurrency:
 env:
   # Бот живёт ~50 минут и выходит сам, не дожидаясь отмены следующего запуска.
   BOT_RUN_SECONDS: '3000'
-  BOT_POLL_SECONDS: '60'
+  # Пауза между опросами команд в ЛС: getAnswers идёт в long polling,
+  # поэтому ответ приходит почти сразу, а не через минуту.
+  BOT_POLL_SECONDS: '5'
+  BOT_LONG_POLL: '50'
 
 jobs:
   run-bot:

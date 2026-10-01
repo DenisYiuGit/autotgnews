@@ -29,6 +29,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 LAST_TELEGRAM_UPDATE_ID = 0
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
 PUBLISHED_LOCK = threading.Lock()
+SETTINGS_LOCK = threading.RLock()
 
 # Кэш уже скачанных страниц статей и проверенных картинок за один запуск:
 # без него один и тот же URL скачивается десятки раз и бот не успевает
@@ -88,6 +89,18 @@ if TELEGRAM_CHANNEL_LINK and "@" not in TELEGRAM_CHANNEL_NAME and "Наша Ра
         TELEGRAM_CHANNEL_NAME = f"⚡️ {default_slug}"
 
 
+def _write_settings(settings):
+    """Атомарная запись: сначала во временный файл, потом переименование.
+    Нужно, чтобы два потока (опрос команд и публикация) не оставили
+    settings.json в обрезанном виде."""
+    tmp_path = SETTINGS_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, SETTINGS_PATH)
+
+
 def load_settings():
     default_settings = {
         "interval_minutes": 60,
@@ -98,14 +111,34 @@ def load_settings():
         "manual_post_done": False,
         "last_processed_update_id": 0,
     }
-    if not os.path.exists(SETTINGS_PATH):
-        save_settings(default_settings)
-        return default_settings.copy()
+    with SETTINGS_LOCK:
+        if not os.path.exists(SETTINGS_PATH):
+            _write_settings(default_settings)
+            return default_settings.copy()
+        return _read_settings_unlocked()
+
+
+def save_settings(settings):
+    with SETTINGS_LOCK:
+        _write_settings(settings)
+
+
+def _read_settings_unlocked():
+    default_settings = {
+        "interval_minutes": 60,
+        "last_post_time": None,
+        "total_posts": 0,
+        "total_tokens": 0,
+        "manual_trigger": False,
+        "manual_post_done": False,
+        "last_processed_update_id": 0,
+    }
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        save_settings(default_settings)
+        return default_settings.copy()
+    if not isinstance(data, dict):
         return default_settings.copy()
     for key, value in default_settings.items():
         if key not in data:
@@ -113,9 +146,28 @@ def load_settings():
     return data
 
 
-def save_settings(settings):
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+def update_settings(**changes):
+    """Читает настройки, меняет указанные поля и сохраняет — атомарно.
+    Нужно потокам, чтобы не затереть правки друг друга."""
+    with SETTINGS_LOCK:
+        data = _read_settings_unlocked()
+        data.update(changes)
+        _write_settings(data)
+        return data
+
+
+def bump_settings(**counters):
+    """Прибавляет к числовым счётчикам, остальные поля просто ставит."""
+    with SETTINGS_LOCK:
+        data = _read_settings_unlocked()
+        for key, delta in counters.items():
+            try:
+                current = int(data.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                current = 0
+            data[key] = current + delta
+        _write_settings(data)
+        return data
 
 
 # Расширенный список RSS-лент (новости, экономика, IT)
@@ -364,11 +416,14 @@ PUBLISH_BUDGET_SECONDS = int(os.environ.get("PUBLISH_BUDGET_SECONDS", "1500"))
 ARTICLE_FETCH_TIMEOUT = 10
 SERVICE_RUN_SECONDS = int(os.environ.get("BOT_RUN_SECONDS", "3000"))
 
-# Как часто бот просыпается проверять команды в ЛС и пора ли постить.
-INTERVAL_POLL_SECONDS = int(os.environ.get("BOT_POLL_SECONDS", "60"))
+# Пауза между опросами команд. getUpdates идёт в long polling и возвращает
+# результат сразу, как только команда пришла, поэтому реальная задержка
+# ответа упирается только в эту паузу — держим её маленькой.
+INTERVAL_POLL_SECONDS = int(os.environ.get("BOT_POLL_SECONDS", "5"))
 
 # Long polling getUpdates: сколько секунд ждать новую команду от Telegram.
-LONG_POLL_TIMEOUT = int(os.environ.get("BOT_LONG_POLL", "25"))
+# Telegram допускает максимум 50.
+LONG_POLL_TIMEOUT = int(os.environ.get("BOT_LONG_POLL", "50"))
 
 BAD_IMAGE_TOKENS = (
     "logo", "icon", "avatar", "sprite", "emoji", "placeholder",
@@ -978,9 +1033,7 @@ def generate_rewrite(title, summary, article_url):
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=40)
         if res.status_code == 429:
-            settings = load_settings()
-            settings["interval_minutes"] = 120
-            save_settings(settings)
+            update_settings(interval_minutes=120)
             print("Превышен лимит Groq (429). Интервал увеличен до 120 минут.")
             return None
         if res.status_code != 200:
@@ -1242,11 +1295,7 @@ def process_updates():
             help_text = """<b>Telegram News Bot</b>\n\nКоманды:\n/start — приветствие и справка\n/post_now — опубликовать новость немедленно\n/set_interval 30 — задать интервал в минутах\n/stats — показать статистику\n/help — список команд"""
             send_telegram_message(chat_id, help_text)
         elif command == "/post_now":
-            settings = load_settings()
-            settings["manual_trigger"] = True
-            settings["manual_post_done"] = True
-            settings["last_processed_update_id"] = update_id
-            save_settings(settings)
+            update_settings(manual_trigger=True, manual_post_done=True)
             send_telegram_message(chat_id, "<b>Ручной запуск активирован.</b>")
         elif command.startswith("/set_interval"):
             args = text.split()
@@ -1260,10 +1309,7 @@ def process_updates():
             except ValueError:
                 send_telegram_message(chat_id, "Неверное значение. Используйте целое число минут больше 0.")
                 continue
-            settings = load_settings()
-            settings["interval_minutes"] = minutes
-            settings["last_processed_update_id"] = update_id
-            save_settings(settings)
+            update_settings(interval_minutes=minutes)
             send_telegram_message(chat_id, f"<b>Интервал установлен:</b> {minutes} минут.")
         elif command == "/stats":
             settings = load_settings()
@@ -1282,14 +1328,10 @@ def process_updates():
             send_telegram_message(chat_id, "Неизвестная команда. Используйте /help.")
 
         processed_any = True
-        settings = load_settings()
-        settings["last_processed_update_id"] = update_id
-        save_settings(settings)
+        update_settings(last_processed_update_id=update_id)
 
     if newest_update_id > last_processed:
-        settings = load_settings()
-        settings["last_processed_update_id"] = newest_update_id
-        save_settings(settings)
+        update_settings(last_processed_update_id=newest_update_id)
         LAST_TELEGRAM_UPDATE_ID = newest_update_id
 
     return processed_any
@@ -1302,8 +1344,7 @@ def process_updates():
 def check_and_post():
     settings = load_settings()
     if settings.get("manual_post_done") and not settings.get("manual_trigger"):
-        settings["manual_post_done"] = False
-        save_settings(settings)
+        update_settings(manual_post_done=False)
         return False
 
     if settings.get("manual_trigger"):
@@ -1311,15 +1352,11 @@ def check_and_post():
         if manual_post_done:
             print("Ручной запуск /post_now активирован.")
             posted = publish_news_once()
-            settings = load_settings()
-            settings["manual_trigger"] = False
-            settings["manual_post_done"] = False
-            save_settings(settings)
+            update_settings(manual_trigger=False, manual_post_done=False)
             if not posted:
-                print("Ручной запуск не удался: не нашлось новости с нормальной картинкой.")
+                print("Ручной запуск не удалось: не нашлось новости с нормальной картинкой.")
             return posted
-        settings["manual_trigger"] = False
-        save_settings(settings)
+        update_settings(manual_trigger=False)
         return False
 
     interval_minutes = max(1, int(settings.get("interval_minutes", 60)))
@@ -1492,13 +1529,12 @@ def publish_news_once():
 
         print("Статистика опубликована успешно")
 
-        settings = load_settings()
-        settings["last_post_time"] = time.time()
-        settings["total_posts"] = int(settings.get("total_posts", 0)) + 1
-        settings["total_tokens"] = int(settings.get("total_tokens", 0)) + int(last_usage.get("total_tokens", 0))
-        settings["manual_trigger"] = False
-        settings["manual_post_done"] = False
-        save_settings(settings)
+        bump_settings(
+            total_posts=1,
+            total_tokens=int(last_usage.get("total_tokens", 0)),
+            last_post_time=time.time(),
+        )
+        update_settings(manual_trigger=False, manual_post_done=False)
 
         send_log_to_admin(title, article_url)
         return True
@@ -1510,32 +1546,28 @@ def publish_news_once():
     return False
 
 
-def run_service_loop():
-    """Держит бота живым: раз в INTERVAL_POLL_SECONDS опрашивает команды в ЛС
-    и публикует новость, когда подошёл интервал.
+def _command_poller(stop_event):
+    """Фоновый поток: только опрашивает команды в ЛС и отвечает на них.
 
-    Раньше скрипт делал один process_updates() и сразу exit(0) — бот жил
-    несколько секунд в час и команды в личку просто не успевал забрать.
+    Раньше команды обрабатывались в том же цикле, что и публикация, поэтому
+    ответ ждал окончания поиска новости и картинки — это минуты. Вынесено в
+    отдельный поток, чтобы /help или /stats отвечали мгновенно.
     """
-    settings = load_settings()
-    if not settings.get("interval_minutes"):
-        settings["interval_minutes"] = 60
-        save_settings(settings)
-
-    deadline = time.time() + SERVICE_RUN_SECONDS
-    print(f"Бот работает, выход через {SERVICE_RUN_SECONDS} сек.")
-
-    while True:
-        if time.time() >= deadline:
-            print("Время работы истекло, сохраняем настройки и выходим.")
-            save_settings(load_settings())
-            return 0
-
+    while not stop_event.is_set():
         try:
             process_updates()
         except Exception as e:
             print(f"Сбой при обработке команд: {e}")
+        stop_event.wait(INTERVAL_POLL_SECONDS)
 
+
+def _publisher(stop_event):
+    """Фоновый поток: публикует новость, когда подошёл интервал."""
+    next_check = time.time()
+    while not stop_event.is_set():
+        if time.time() < next_check:
+            stop_event.wait(min(5, max(0.5, next_check - time.time())))
+            continue
         try:
             set_deadline(PUBLISH_BUDGET_SECONDS)
             check_and_post()
@@ -1544,16 +1576,38 @@ def run_service_loop():
         finally:
             set_deadline(None)
             clear_caches()
+        # следующая проверка не раньше, чем через минуту: зачем дёргать
+        # RSS-ленты чаще, если интервал постинга измеряется десятками минут
+        next_check = time.time() + 60
 
-        save_settings(load_settings())
-        time.sleep(INTERVAL_POLL_SECONDS)
+
+def run_service_loop():
+    """Держит бота живым: отдельный поток отвечает на команды в ЛС сразу,
+    отдельный — публикует новости по расписанию.
+
+    Раньше скрипт делал один process_updates() и сразу exit(0) — бот жил
+    несколько секунд в час и команды в личку просто не успевал забрать.
+    """
+    if not load_settings().get("interval_minutes"):
+        update_settings(interval_minutes=60)
+
+    stop_event = threading.Event()
+    poller = threading.Thread(target=_command_poller, args=(stop_event,), daemon=True)
+    publisher = threading.Thread(target=_publisher, args=(stop_event,), daemon=True)
+    poller.start()
+    publisher.start()
+
+    print(f"Бот работает, выход через {SERVICE_RUN_SECONDS} сек.")
+    time.sleep(SERVICE_RUN_SECONDS)
+
+    print("Время работы истекло, сохраняем настройки и выходим.")
+    stop_event.set()
+    return 0
 
 
 if __name__ == "__main__":
-    settings = load_settings()
-    if not settings.get("interval_minutes"):
-        settings["interval_minutes"] = 60
-        save_settings(settings)
+    if not load_settings().get("interval_minutes"):
+        update_settings(interval_minutes=60)
 
     clear_caches()
     run_service_loop()
