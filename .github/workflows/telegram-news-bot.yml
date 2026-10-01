@@ -8,9 +8,17 @@ concurrency:
   group: telegram-bot
   cancel-in-progress: true
 
+env:
+  # Бот живёт ~50 минут и выходит сам, не дожидаясь отмены следующего запуска.
+  BOT_RUN_SECONDS: '3000'
+  BOT_POLL_SECONDS: '60'
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    # Держим запас до часа, но сам бот выходит раньше (BOT_RUN_SECONDS),
+    # чтобы следующий cron-запуск не убил текущий на середине.
+    timeout-minutes: 55
     permissions:
       contents: write  # разрешение на запись в репозиторий (для .json)
 
@@ -36,13 +44,12 @@ jobs:
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}  # добавь, если используешь логи
         run: python main.py
 
-      - name: Commit and push updated published.json
+      # published.json — список опубликованных новостей,
+      # settings.json — интервал, статистика и last_processed_update_id.
+      # Без второго файла команды из ЛС забываются при каждом запуске.
+      - name: Commit and push bot state
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add published.json
-          git stash
-          git pull --rebase origin main
-          git stash pop || true
-          git add published.json
-          git diff --staged --quiet || (git commit -m "Update published news [skip ci]" && git push)
+          git add published.json settings.json
+          git diff --staged --quiet || (git commit -m "Update bot state [skip ci]" && git push)

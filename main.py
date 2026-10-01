@@ -30,6 +30,26 @@ LAST_TELEGRAM_UPDATE_ID = 0
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "settings.json")
 PUBLISHED_LOCK = threading.Lock()
 
+# Кэш уже скачанных страниц статей и проверенных картинок за один запуск:
+# без него один и тот же URL скачивается десятки раз и бот не успевает
+# уложиться в часовой лимит GitHub Actions.
+_ARTICLE_PAGE_CACHE = {}
+_IMAGE_CHECK_CACHE = {}
+
+# Момент, после которого сетевые запросы прекращаются (None = без лимита).
+_DEADLINE = None
+
+
+def set_deadline(seconds):
+    """Ограничивает суммарное время сетевой работы текущего запуска."""
+    global _DEADLINE
+    _DEADLINE = time.time() + seconds if seconds else None
+
+
+def clear_caches():
+    _ARTICLE_PAGE_CACHE.clear()
+    _IMAGE_CHECK_CACHE.clear()
+
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
@@ -173,11 +193,14 @@ selected_model = select_model()
 # PUBLISHED
 # ============================================================
 
+PUBLISHED_PATH = os.path.join(os.path.dirname(__file__), "published.json")
+
+
 def load_published():
     with PUBLISHED_LOCK:
-        if os.path.exists("published.json"):
+        if os.path.exists(PUBLISHED_PATH):
             try:
-                with open("published.json", "r", encoding="utf-8") as f:
+                with open(PUBLISHED_PATH, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 print(f"Ошибка чтения published.json: {e}")
@@ -189,7 +212,7 @@ def save_published(published_list):
     for attempt in range(3):
         try:
             with PUBLISHED_LOCK:
-                with open("published.json", "w", encoding="utf-8") as f:
+                with open(PUBLISHED_PATH, "w", encoding="utf-8") as f:
                     json.dump(published_list, f, ensure_ascii=False, indent=2)
             print("Статистика опубликована успешно")
             return True
@@ -323,7 +346,29 @@ IMAGE_ACCEPT = (
 IMAGE_MIN_BYTES = 15000
 IMAGE_MIN_SIDE = 300
 IMAGE_MAX_BYTES = 15 * 1024 * 1024
-IMAGE_TIMEOUT = 15
+IMAGE_TIMEOUT = 10
+
+# Сколько кандидатов-картинок проверяем на одну новость и сколько
+# заранее валидных картинок оставляем про запас (повтор при отказе Telegram).
+IMAGE_CANDIDATE_LIMIT = 6
+IMAGE_GOOD_LIMIT = 2
+
+# Сколько записей берём из каждой RSS-ленты: чем больше, тем выше шанс
+# найти новость с нормальной картинкой.
+FEED_ENTRIES_PER_SOURCE = 12
+
+# Границы времени. GitHub Actions убивает джобу, если она идёт дольше
+# часа, а следующий cron-запуск с cancel-in-progress убивает текущий ещё
+# раньше. Поэтому работаем в жёстком бюджете времени.
+PUBLISH_BUDGET_SECONDS = int(os.environ.get("PUBLISH_BUDGET_SECONDS", "1500"))
+ARTICLE_FETCH_TIMEOUT = 10
+SERVICE_RUN_SECONDS = int(os.environ.get("BOT_RUN_SECONDS", "3000"))
+
+# Как часто бот просыпается проверять команды в ЛС и пора ли постить.
+INTERVAL_POLL_SECONDS = int(os.environ.get("BOT_POLL_SECONDS", "60"))
+
+# Long polling getUpdates: сколько секунд ждать новую команду от Telegram.
+LONG_POLL_TIMEOUT = int(os.environ.get("BOT_LONG_POLL", "25"))
 
 BAD_IMAGE_TOKENS = (
     "logo", "icon", "avatar", "sprite", "emoji", "placeholder",
@@ -526,10 +571,20 @@ def _image_is_blank_heuristic(data, width, height):
 
 def fetch_and_check_image(url):
     """Скачивает картинку и проверяет, что она настоящая и не пустая.
-    Возвращает байты картинки или None."""
+    Возвращает байты картинки или None. Результат кэшируется на запуск."""
     if not is_valid_image_url(url):
         return None
+    if url in _IMAGE_CHECK_CACHE:
+        return _IMAGE_CHECK_CACHE[url]
+    if _DEADLINE and time.time() > _DEADLINE:
+        return None
 
+    result = _fetch_and_check_image_uncached(url)
+    _IMAGE_CHECK_CACHE[url] = result
+    return result
+
+
+def _fetch_and_check_image_uncached(url):
     headers = dict(BROWSER_HEADERS)
     headers["Accept"] = IMAGE_ACCEPT
     try:
@@ -687,24 +742,41 @@ def _collect_jsonld_images(page):
     return urls
 
 
-def collect_article_image_urls(article_url):
-    """Ссылки на картинки со страницы статьи, от лучших к худшим."""
+def fetch_article_page(article_url):
+    """Скачивает HTML статьи один раз и кладёт в кэш (общий на все кандидаты)."""
     if not article_url or not isinstance(article_url, str):
-        return []
+        return None
     article_url = article_url.strip()
     if not article_url.startswith(("http://", "https://")):
-        return []
-
+        return None
+    if article_url in _ARTICLE_PAGE_CACHE:
+        return _ARTICLE_PAGE_CACHE[article_url]
+    if _DEADLINE and time.time() > _DEADLINE:
+        return None
     try:
         response = requests.get(
-            article_url, headers=BROWSER_HEADERS, timeout=15, allow_redirects=True
+            article_url,
+            headers=BROWSER_HEADERS,
+            timeout=ARTICLE_FETCH_TIMEOUT,
+            allow_redirects=True,
         )
         if response.status_code != 200:
-            return []
+            _ARTICLE_PAGE_CACHE[article_url] = None
+            return None
         response.encoding = response.apparent_encoding or "utf-8"
         page = response.text
+        _ARTICLE_PAGE_CACHE[article_url] = page
+        return page
     except Exception as e:
         print(f"Ошибка загрузки страницы статьи: {e}")
+        _ARTICLE_PAGE_CACHE[article_url] = None
+        return None
+
+
+def collect_article_image_urls(article_url):
+    """Ссылки на картинки со страницы статьи, от лучших к худшим."""
+    page = fetch_article_page(article_url)
+    if not page:
         return []
 
     urls = []
@@ -769,18 +841,34 @@ def resolve_image_urls(entry, article_url):
     return ordered
 
 
-def pick_valid_image(image_urls):
-    """Перебирает ссылки и возвращает первую реально пригодную картинку."""
+def pick_valid_images(image_urls):
+    """Возвращает список реально пригодных картинок (до IMAGE_GOOD_LIMIT).
+    Первой будет лучшая — её и отправляем в канал."""
+    good = []
     if not image_urls:
         print("Ни в RSS, ни на странице статьи картинка не нашлась.")
-        return None
-    print(f"Кандидатов на картинку: {len(image_urls)}")
+        return good
+
+    checked = 0
     for url in image_urls:
+        if len(good) >= IMAGE_GOOD_LIMIT:
+            break
+        if checked >= IMAGE_CANDIDATE_LIMIT:
+            print(f"Проверили {checked} кандидатов, хватит.")
+            break
+        if _DEADLINE and time.time() > _DEADLINE:
+            print("Время вышло, прекращаем проверку картинок.")
+            break
+        checked += 1
         if fetch_and_check_image(url):
             print(f"Картинка подходит: {url}")
-            return url
-        print("Картинка не подходит, пробуем следующую кандидатуру.")
-    return None
+            good.append(url)
+        else:
+            print("Картинка не подходит, пробуем следующую.")
+
+    if not good:
+        print("Ни одна картинка не прошла проверку.")
+    return good
 
 
 # ============================================================
@@ -1111,8 +1199,8 @@ def process_updates():
     try:
         response = requests.get(
             url,
-            params={"timeout": 0, "limit": 20, "offset": last_processed + 1},
-            timeout=20,
+            params={"timeout": LONG_POLL_TIMEOUT, "limit": 20, "offset": last_processed + 1},
+            timeout=LONG_POLL_TIMEOUT + 15,
         )
         response.raise_for_status()
         updates = response.json().get("result", [])
@@ -1222,12 +1310,14 @@ def check_and_post():
         manual_post_done = bool(settings.get("manual_post_done", False))
         if manual_post_done:
             print("Ручной запуск /post_now активирован.")
-            publish_news_once()
+            posted = publish_news_once()
             settings = load_settings()
             settings["manual_trigger"] = False
             settings["manual_post_done"] = False
             save_settings(settings)
-            return True
+            if not posted:
+                print("Ручной запуск не удался: не нашлось новости с нормальной картинкой.")
+            return posted
         settings["manual_trigger"] = False
         save_settings(settings)
         return False
@@ -1240,8 +1330,7 @@ def check_and_post():
         should_post = (time.time() - float(last_post_time)) >= (interval_minutes * 60)
 
     if should_post:
-        publish_news_once()
-        return True
+        return publish_news_once()
     return False
 
 
@@ -1315,10 +1404,9 @@ def news_score(entry):
 # MAIN
 # ============================================================
 
-def publish_news_once():
-    published = load_published()
+def collect_candidates(published):
+    """Собирает свежие новости из всех лент."""
     all_candidates = []
-
     for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
@@ -1326,17 +1414,29 @@ def publish_news_once():
             print(f"Ошибка чтения RSS {feed_url}: {e}")
             continue
 
-        for entry in feed.entries[:5]:
+        entries = getattr(feed, "entries", []) or []
+        if not entries:
+            print(f"Лента пустая: {feed_url}")
+            continue
+
+        for entry in entries[:FEED_ENTRIES_PER_SOURCE]:
             entry_id = entry.get("id") or entry.get("link")
-            if not entry_id:
-                continue
-            if entry_id in published:
+            if not entry_id or entry_id in published:
                 continue
             all_candidates.append(entry)
+    return all_candidates
+
+
+def publish_news_once():
+    published = load_published()
+    all_candidates = collect_candidates(published)
 
     if not all_candidates:
         print("Новых новостей не найдено.")
         return False
+
+    print(f"Всего кандидатов: {len(all_candidates)}")
+    checked_without_image = 0
 
     for candidate in sorted(all_candidates, key=news_score, reverse=True):
         title = candidate.get("title", "")
@@ -1351,15 +1451,20 @@ def publish_news_once():
             print("ID новости уже есть в published.json, пропускаем дубль.")
             continue
 
-        image_candidates = resolve_image_urls(candidate, article_url)
-        image_url = pick_valid_image(image_candidates)
-        if not image_url:
-            print(f"У новости не нашлось нормальной картинки — сразу берём другую: {title}")
-            continue
+        # Никаких лимитов на количество перепробованных новостей:
+        # если у этой нет картинки — просто берём следующую.
+        if _DEADLINE and time.time() > _DEADLINE:
+            print("Исчерпан лимит времени на поиск новости с картинкой.")
+            return False
 
-        ordered_images = [image_url] + [
-            url for url in image_candidates if url != image_url
-        ]
+        image_candidates = resolve_image_urls(candidate, article_url)
+        good_images = pick_valid_images(image_candidates)
+        if not good_images:
+            checked_without_image += 1
+            print(
+                f"У новости не нашлось нормальной картинки — сразу берём другую: {title}"
+            )
+            continue
 
         print(f"\nОбработка новости: {title}")
         rewritten = generate_rewrite(title, summary, article_url)
@@ -1370,7 +1475,7 @@ def publish_news_once():
         print("\nСформированный пост:")
         print(rewritten)
 
-        if not send_telegram(rewritten, ordered_images):
+        if not send_telegram(rewritten, good_images):
             print("Пост с картинкой не ушёл, пробуем следующую новость.")
             continue
 
@@ -1398,8 +1503,50 @@ def publish_news_once():
         send_log_to_admin(title, article_url)
         return True
 
-    print("Подходящих новостей с картинкой не найдено.")
+    print(
+        f"Подходящих новостей с картинкой не найдено "
+        f"(проверено без картинки: {checked_without_image})."
+    )
     return False
+
+
+def run_service_loop():
+    """Держит бота живым: раз в INTERVAL_POLL_SECONDS опрашивает команды в ЛС
+    и публикует новость, когда подошёл интервал.
+
+    Раньше скрипт делал один process_updates() и сразу exit(0) — бот жил
+    несколько секунд в час и команды в личку просто не успевал забрать.
+    """
+    settings = load_settings()
+    if not settings.get("interval_minutes"):
+        settings["interval_minutes"] = 60
+        save_settings(settings)
+
+    deadline = time.time() + SERVICE_RUN_SECONDS
+    print(f"Бот работает, выход через {SERVICE_RUN_SECONDS} сек.")
+
+    while True:
+        if time.time() >= deadline:
+            print("Время работы истекло, сохраняем настройки и выходим.")
+            save_settings(load_settings())
+            return 0
+
+        try:
+            process_updates()
+        except Exception as e:
+            print(f"Сбой при обработке команд: {e}")
+
+        try:
+            set_deadline(PUBLISH_BUDGET_SECONDS)
+            check_and_post()
+        except Exception as e:
+            print(f"Сбой при публикации: {e}")
+        finally:
+            set_deadline(None)
+            clear_caches()
+
+        save_settings(load_settings())
+        time.sleep(INTERVAL_POLL_SECONDS)
 
 
 if __name__ == "__main__":
@@ -1408,6 +1555,6 @@ if __name__ == "__main__":
         settings["interval_minutes"] = 60
         save_settings(settings)
 
-    process_updates()
-    check_and_post()
+    clear_caches()
+    run_service_loop()
     exit(0)
